@@ -1,0 +1,186 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Scratchwork on developing a web-tool on vulnerable population access to feeding sites set up in response to COVID-19 shutdown of schools
+
+```{r, include=FALSE}
+
+rm(list=ls(all=TRUE)) # Clear the workspace
+
+#Load libraries
+library(tidyverse) # data manipulation, data shaping
+library(mapproj) # ggplot coordinate projections
+library(patchwork) # combining ggplots | devtools::install_github("thomasp85/patchwork")
+library(geojsonio) # import geojson
+library(broom) # fortify geojson to dataframe
+library(viridis) # color palettes
+library(ggsn) # scale bar and compass for ggmap
+library(osmdata) # main transit routes
+library(maptools) # union spatial polygons
+library(ggforce) # geom_shape (expanded polygon)
+library(sf) #spatial frames
+library(tmap)
+library(RANN)
+library(summarytools)
+library(rgdal)
+library(spdplyr)
+library(geojsonio)
+library(rmapshaper)
+library(ggmap)
+library(tidygeocoder) ## geocoder
+setwd("~/GitHub/covid19_feeding_sites")
+```
+
+Importing feeding sites and geocoding:
+Feeding sites are downloaded daily from MSDE: {link}
+Some hand cleaning of addresses is neccessary prior to geocoding
+
+
+```{r}
+#import MSDE list
+
+feeding_sites <- read.csv("baltimore-city-sites-2020-04-02.csv")
+
+feeding_sites$address = paste(feeding_sites$Street, ",", feeding_sites$City, ", MD,", feeding_sites$Zip)
+coordinates <- feeding_sites %>% 
+  geocode(address = address, method = "cascade")
+coordinates <- coordinates %>% 
+  filter(!is.na(lat))
+
+feeding_sites_sf <- st_as_sf(coordinates, coords = c("long", "lat"))
+
+tm_shape(feeding_sites_sf) + tm_dots()
+```
+
+```{r}
+# #Census tracts
+# md_census_tracts <- readOGR(dsn = "tl_2019_24_tract.shp")
+# md_census_tracts <- st_as_sf(md_census_tracts)
+# 
+# #Baltimore Neighborhood Outline
+# temp<-tempfile()
+# download.file("https://data.baltimorecity.gov/api/geospatial/5cni-ybar?method=export&format=GeoJSON", temp)
+# balt_neighborhoods <- temp %>%
+#   st_read()
+# 
+# #Project
+# balt_neighborhoods = st_set_crs(balt_neighborhoods, 4326)
+# 
+tm_shape(balt_neighborhoods) + tm_polygons(col = "white") + 
+   tm_shape(feeding_sites_sf) + tm_dots(col = "orangered1", size = .25)
+```
+Building the control points
+```{r, include=FALSE}
+#1. City Outline - download from NPR apps github page
+temp<-tempfile()
+download.file("https://raw.githubusercontent.com/nprapps/heat-income/master/boundaries/baltimore.json", temp)
+outline <- st_read(temp)
+rm(temp)
+
+#2. Baltimore Neighborhood Outline
+temp<-tempfile()
+download.file("https://data.baltimorecity.gov/api/geospatial/5cni-ybar?method=export&format=GeoJSON", temp)
+balt_neighborhoods <- temp %>%
+  st_read()
+
+#Identification of industrial/parks
+nbr_nonres<-read.csv("nbr_nonres_status.csv")
+
+balt_neighborhoods<-balt_neighborhoods %>%
+  left_join(nbr_nonres, by = "nbrdesc")
+
+#Res polygons
+balt_res <- balt_neighborhoods %>%
+  filter(nonres_status==0)
+
+#Nonres polygons
+balt_nonres <- balt_neighborhoods %>%
+  filter(nonres_status==1)
+
+# Projecting to same crs
+balt_neighborhoods = st_set_crs(balt_neighborhoods, 4326)
+outline = st_set_crs(outline, 4326)
+balt_res = st_set_crs(balt_res, 4326)
+balt_nonres = st_set_crs(balt_nonres, 4326)
+
+#Creating Grid
+#Following code: https://rpubs.com/dieghernan/beautifulmaps_I
+initial <- outline
+initial$index_target <- 1:nrow(initial)
+target <- st_geometry(initial)
+
+#Find dimensions of the grid (my code - not 100% where it needs to be)
+xmin = st_bbox(outline)[c("xmin")]
+xmax = st_bbox(outline)[c("xmax")]
+#set to .001 degree
+xnum = (xmax-xmin)/.001
+
+ymin = st_bbox(outline)[c("ymin")]
+ymax = st_bbox(outline)[c("ymax")]
+#set to .001 degree
+ynum = (ymax-ymin)/.001
+
+#Grid 
+grid <- st_make_grid(target,
+                     n = c(xnum, xnum), 
+                     crs = st_crs(initial),
+                     what = "polygons",
+                     square = TRUE
+)
+#convert to sf
+grid <- st_sf(index = 1:length(lengths(grid)), grid) # Add index
+
+# We identify the grids that belongs to a entity by assessing the centroid
+cent_grid <- st_centroid(grid)
+cent_merge <- st_join(cent_grid, initial["index_target"], left = F)
+centers_new <- inner_join(grid, st_drop_geometry(cent_merge))
+
+
+#End: https://rpubs.com/dieghernan/beautifulmaps_I
+
+#Rename centers
+centers <- cent_merge
+
+##Clipping centers to the shape of Baltimore
+
+
+# Spatial Join - point to polygons
+join_analytic <- st_join(centers, balt_neighborhoods) # Merge to all points
+
+# Filter out NAs (points that did not join to neighborhood map)
+baltimore_control_points <-join_analytic %>% filter(!is.na(nbrdesc))
+
+
+#Export Centers to feed to OTP
+st_write(baltimore_control_points, "baltimore_control_points.csv", layer_options = "GEOMETRY=AS_XY", delete_dsn = TRUE)
+
+rm(balt_res, cent_grid, cent_merge, centers, centers_new, coordinates, feeding_sites, grid, initial, join_analytic, nbr_nonres, outline, target)
+
+```
+
+```{r}
+#BALTIMORE ONLY
+baltimore_sites <- feeding_sites_sf %>% 
+  filter(County == "BALTIMORE CITY")
+
+baltimore_tracts <- md_census_tracts %>% 
+  filter(COUNTYFP == "510")
+
+#Baltimore Water
+balt_water <- readOGR(dsn = "tl_2019_24510_areawater.shp")
+balt_water <- st_as_sf(balt_water)
+
+balt_tract_water_clip <- st_difference(baltimore_tracts, balt_water)
+
+tm_shape(baltimore_tracts) + tm_polygons(col = "white")+
+  tm_shape(balt_water) + tm_polygons(col = "steelblue2") + 
+  tm_shape(baltimore_sites) + tm_dots(col = "orangered1", size = .25)
+
+```
+
+
+
+
+
